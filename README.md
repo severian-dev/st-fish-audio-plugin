@@ -32,6 +32,9 @@ All under `/api/plugins/fish-audio`, behind SillyTavern's login.
 | `GET /credit` | Your Fish API credit. |
 | `POST /tts` | Starts synthesis. Answers with a job id once Fish accepts the request. |
 | `GET /tts/:id` | Streams the job's MP3. |
+| `POST /design` | Designs voices from a description (Fish Voice Design, $0.01 each). Answers with candidates to audition. |
+| `GET /design/:id/:index` | Plays a candidate (WAV). |
+| `POST /design/:id/:index/save` | Saves a candidate as a private voice on the user's Fish account. |
 | `GET /cache` | Cached clips and bytes for this user. |
 | `DELETE /cache` | Clears this user's cache. |
 
@@ -43,6 +46,8 @@ All under `/api/plugins/fish-audio`, behind SillyTavern's login.
 - At most 5 Fish requests run at once per key. Busy answers (429) are retried with backoff.
 - Audio jobs belong to the user who started them and stay in memory for 30 minutes after they finish.
 - An expired job answers with a short silence, so SillyTavern's TTS queue keeps moving.
+- Designed candidates stay in memory for 30 minutes, so the audio never travels back up from the browser. Saving sends
+  Fish the candidate's signature, which marks the new voice as designed.
 - Generated audio is cached per user in `data/_cache/fish-audio`, up to 200 MB each, least recently used first. A repeat
   request is served from disk. Identical requests still generating share one Fish call. Send `cache: false` to skip it.
 

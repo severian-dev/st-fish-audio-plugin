@@ -4,7 +4,7 @@ import { describe, it } from 'node:test';
 import { FishError, startTts, toFishError } from '../lib/fish.js';
 import { JobStore } from '../lib/jobs.js';
 import { KeyedLimiter } from '../lib/limiter.js';
-import { buildTtsRequest, buildVoiceQuery, DEFAULT_MODEL, mapVoice, RequestError } from '../lib/validate.js';
+import { buildDesignRequest, buildTtsRequest, buildVoiceQuery, DEFAULT_MODEL, mapVoice, RequestError } from '../lib/validate.js';
 
 const VOICE = 'f3a2b90078d54a65af4b95f63bc7798e';
 const VOICE2 = 'd13f84b987ad4f22b56d2b47f4eb838e';
@@ -226,5 +226,24 @@ describe('Fish client', () => {
         const error = await toFishError(new Response('<html>oops</html>', { status: 503 }));
         assert.equal(error.status, 502);
         assert.match(error.message, /HTTP 503/);
+    });
+});
+
+describe('buildDesignRequest', () => {
+    it('trims and defaults to 3 candidates', () => {
+        assert.deepEqual(buildDesignRequest({ instruction: '  warm narrator  ', reference_text: ' Hello. ', language: 'en' }),
+            { instruction: 'warm narrator', reference_text: 'Hello.', language: 'en', n: 3 });
+    });
+
+    it('drops an empty preview line', () => {
+        assert.deepEqual(buildDesignRequest({ instruction: 'x', reference_text: '   ' }), { instruction: 'x', n: 3 });
+    });
+
+    it('rejects bad input', () => {
+        for (const bad of [null, [], {}, { instruction: '' }, { instruction: 'x'.repeat(2001) },
+            { instruction: 'x', reference_text: 'y'.repeat(151) }, { instruction: 'x', language: 'english' },
+            { instruction: 'x', n: 5 }, { instruction: 'x', n: 0 }, { instruction: 'x', n: 2.5 }]) {
+            assert.throws(() => buildDesignRequest(bad), RequestError, JSON.stringify(bad));
+        }
     });
 });

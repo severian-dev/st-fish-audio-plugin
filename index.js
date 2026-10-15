@@ -8,10 +8,12 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { AudioCache } from './lib/cache.js';
-import { FishError, getJson, startTts } from './lib/fish.js';
+import { randomUUID } from 'node:crypto';
+
+import { FishError, getJson, postFish, startTts } from './lib/fish.js';
 import { JobStore } from './lib/jobs.js';
 import { KeyedLimiter } from './lib/limiter.js';
-import { buildTtsRequest, buildVoiceQuery, DEFAULT_MODEL, isVoiceId, mapVoice, MODELS, RequestError } from './lib/validate.js';
+import { buildDesignRequest, buildTtsRequest, buildVoiceQuery, DEFAULT_MODEL, isVoiceId, mapVoice, MODELS, RequestError } from './lib/validate.js';
 
 const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 const TAG = '[fish-audio]';
@@ -35,6 +37,15 @@ const limiter = new KeyedLimiter(CONCURRENCY);
 let cache;
 /** Jobs still generating, by owner and cache key, so identical requests share one Fish call. */
 const pending = new Map();
+/**
+ * Voice design results waiting for the user to pick one, kept server side so
+ * the audio never has to travel back up from the browser.
+ * @type {Map<string, {owner: string, at: number, candidates: {index: number, wav: Buffer, signature: string, text: string}[]}>}
+ */
+const designs = new Map();
+const DESIGN_TTL_MS = 30 * 60_000;
+const DESIGN_MODEL = 'voice-design-1';
+const SAVE_TIMEOUT_MS = 180_000;
 /** @type {Set<AbortController>} */
 const inFlight = new Set();
 /** @type {NodeJS.Timeout|undefined} */
@@ -139,7 +150,10 @@ export async function init(router) {
     readSecret = await loadReadSecret();
     const dataRoot = globalThis.DATA_ROOT ?? path.join(process.cwd(), 'data');
     cache = new AudioCache({ root: path.join(dataRoot, '_cache', 'fish-audio') });
-    sweepTimer = setInterval(() => jobs.sweep(), 60_000);
+    sweepTimer = setInterval(() => {
+        jobs.sweep();
+        for (const [id, design] of designs) if (Date.now() - design.at > DESIGN_TTL_MS) designs.delete(id);
+    }, 60_000);
     sweepTimer.unref();
 
     router.get('/status', (req, res) => {
@@ -148,7 +162,7 @@ export async function init(router) {
             keySet: Boolean(keyFor(req)),
             models: MODELS,
             defaultModel: DEFAULT_MODEL,
-            features: ['cache'],
+            features: ['cache', 'design'],
         });
     });
 
@@ -203,6 +217,96 @@ export async function init(router) {
             if (!key) throw new RequestError('No Fish API key set.', 401);
             const data = await getJson('/wallet/self/api-credit', { key, signal: AbortSignal.timeout(JSON_TIMEOUT_MS) });
             res.json({ credit: data?.credit ?? null });
+        } catch (error) {
+            sendError(res, error);
+        }
+    });
+
+    // Voice design: describe a voice, get candidates to audition, save one as a
+    // private voice on the user's Fish account. $0.01 per design request.
+    router.post('/design', async (req, res) => {
+        /** @type {(() => void)|null} */
+        let release = null;
+        try {
+            const key = keyFor(req);
+            if (!key) throw new RequestError('No Fish API key set. Add it in the Fish Audio TTS settings.', 401);
+            const body = buildDesignRequest(req.body);
+            release = await limiter.acquire(key);
+            const data = await postFish('/v1/voice-design', {
+                key,
+                body: JSON.stringify(body),
+                headers: { 'Content-Type': 'application/json', 'model': DESIGN_MODEL },
+                signal: AbortSignal.timeout(HEADER_TIMEOUT_MS),
+            });
+            const candidates = (Array.isArray(data?.candidates) ? data.candidates : [])
+                .filter(c => typeof c?.audio_base64 === 'string' && typeof c?.signature === 'string');
+            if (!candidates.length) throw new FishError(502, 'Fish returned no voice candidates. Try a different description.');
+            const id = randomUUID();
+            designs.set(id, {
+                owner: ownerOf(req),
+                at: Date.now(),
+                candidates: candidates.map((c, i) => ({
+                    index: i,
+                    wav: Buffer.from(c.audio_base64, 'base64'),
+                    signature: c.signature,
+                    text: String(c.text ?? body.reference_text ?? ''),
+                })),
+            });
+            res.json({
+                id,
+                candidates: candidates.map((c, i) => ({
+                    index: i,
+                    durationMs: Number(c.duration_ms) || 0,
+                    description: String(c.features?.description ?? ''),
+                    traits: ['gender', 'age', 'accent', 'tone', 'pacing']
+                        .map(k => c.features?.[k]).filter(v => typeof v === 'string' && v).map(String),
+                })),
+            });
+        } catch (error) {
+            sendError(res, error);
+        } finally {
+            release?.();
+        }
+    });
+
+    /** @param {import('express').Request} req */
+    function findCandidate(req) {
+        const design = designs.get(req.params.id);
+        const candidate = design && design.owner === ownerOf(req) ? design.candidates[Number(req.params.index)] : null;
+        if (!candidate) throw new RequestError('That design has expired. Design the voice again.', 404);
+        return candidate;
+    }
+
+    router.get('/design/:id/:index', (req, res) => {
+        try {
+            const candidate = findCandidate(req);
+            res.setHeader('Content-Type', 'audio/wav');
+            res.setHeader('Cache-Control', 'no-store');
+            sendBuffer(req, res, candidate.wav);
+        } catch (error) {
+            sendError(res, error);
+        }
+    });
+
+    // Saving creates a private voice on the user's Fish account. The candidate's
+    // signature gets it marked as a designed voice. Fish takes about 15 seconds.
+    router.post('/design/:id/:index/save', async (req, res) => {
+        try {
+            const key = keyFor(req);
+            if (!key) throw new RequestError('No Fish API key set.', 401);
+            const candidate = findCandidate(req);
+            const title = typeof req.body?.title === 'string' ? req.body.title.trim().slice(0, 100) : '';
+            if (!title) throw new RequestError('Give the voice a name');
+            const form = new FormData();
+            form.append('type', 'tts');
+            form.append('title', title);
+            form.append('train_mode', 'fast');
+            form.append('visibility', 'private');
+            form.append('voices', new Blob([candidate.wav], { type: 'audio/wav' }), 'voice.wav');
+            if (candidate.text) form.append('texts', candidate.text);
+            form.append('voice_design_signatures', candidate.signature);
+            const data = await postFish('/model', { key, body: form, signal: AbortSignal.timeout(SAVE_TIMEOUT_MS) });
+            res.status(201).json(mapVoice(data));
         } catch (error) {
             sendError(res, error);
         }
@@ -300,6 +404,7 @@ export async function init(router) {
 
 export async function exit() {
     clearInterval(sweepTimer);
+    designs.clear();
     for (const controller of inFlight) controller.abort();
     jobs.clear();
 }
