@@ -32,6 +32,8 @@ All under `/api/plugins/fish-audio`, behind SillyTavern's login.
 | `GET /credit` | Your Fish API credit. |
 | `POST /tts` | Starts synthesis. Answers with a job id once Fish accepts the request. |
 | `GET /tts/:id` | Streams the job's MP3. |
+| `GET /cache` | Cached clips and bytes for this user. |
+| `DELETE /cache` | Clears this user's cache. |
 
 ## Notes
 
@@ -41,6 +43,8 @@ All under `/api/plugins/fish-audio`, behind SillyTavern's login.
 - At most 5 Fish requests run at once per key. Busy answers (429) are retried with backoff.
 - Audio jobs belong to the user who started them and stay in memory for 30 minutes after they finish.
 - An expired job answers with a short silence, so SillyTavern's TTS queue keeps moving.
+- Generated audio is cached per user in `data/_cache/fish-audio`, up to 200 MB each, least recently used first. A repeat
+  request is served from disk. Identical requests still generating share one Fish call. Send `cache: false` to skip it.
 
 ## License
 

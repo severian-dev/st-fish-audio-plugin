@@ -1,6 +1,6 @@
 {
     "name": "st-fish-audio-plugin",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "SillyTavern server plugin that connects the Fish Audio TTS extension to Fish Audio's API.",
     "type": "module",
     "main": "index.js",
