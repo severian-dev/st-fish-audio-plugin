@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { AudioCache } from './lib/cache.js';
 import { FishError, getJson, startTts } from './lib/fish.js';
 import { JobStore } from './lib/jobs.js';
 import { KeyedLimiter } from './lib/limiter.js';
@@ -30,6 +31,10 @@ export const info = {
 
 const jobs = new JobStore();
 const limiter = new KeyedLimiter(CONCURRENCY);
+/** @type {AudioCache} */
+let cache;
+/** Jobs still generating, by owner and cache key, so identical requests share one Fish call. */
+const pending = new Map();
 /** @type {Set<AbortController>} */
 const inFlight = new Set();
 /** @type {NodeJS.Timeout|undefined} */
@@ -75,8 +80,9 @@ function sendError(res, error) {
  * @param {Response} response
  * @param {AbortController} controller
  * @param {() => void} release
+ * @param {(job: import('./lib/jobs.js').Job) => void} onDone Runs after the job finishes, ok or not
  */
-async function pump(job, response, controller, release) {
+async function pump(job, response, controller, release, onDone) {
     /** @type {NodeJS.Timeout|undefined} */
     let idle;
     const arm = () => {
@@ -98,6 +104,7 @@ async function pump(job, response, controller, release) {
         clearTimeout(idle);
         release();
         inFlight.delete(controller);
+        onDone(job);
     }
 }
 
@@ -130,6 +137,8 @@ function sendBuffer(req, res, buffer) {
 /** @param {import('express').Router} router */
 export async function init(router) {
     readSecret = await loadReadSecret();
+    const dataRoot = globalThis.DATA_ROOT ?? path.join(process.cwd(), 'data');
+    cache = new AudioCache({ root: path.join(dataRoot, '_cache', 'fish-audio') });
     sweepTimer = setInterval(() => jobs.sweep(), 60_000);
     sweepTimer.unref();
 
@@ -139,7 +148,25 @@ export async function init(router) {
             keySet: Boolean(keyFor(req)),
             models: MODELS,
             defaultModel: DEFAULT_MODEL,
+            features: ['cache'],
         });
+    });
+
+    router.get('/cache', async (req, res) => {
+        try {
+            res.json(await cache.stats(ownerOf(req)));
+        } catch (error) {
+            sendError(res, error);
+        }
+    });
+
+    router.delete('/cache', async (req, res) => {
+        try {
+            await cache.clear(ownerOf(req));
+            res.json(await cache.stats(ownerOf(req)));
+        } catch (error) {
+            sendError(res, error);
+        }
     });
 
     router.get('/voices', async (req, res) => {
@@ -183,7 +210,8 @@ export async function init(router) {
 
     // Starts synthesis and answers once Fish has accepted the request, so bad
     // keys, missing credit and validation errors come back here, not as a
-    // broken audio stream.
+    // broken audio stream. Cached audio and identical requests already in
+    // progress are reused unless the client sends `cache: false`.
     router.post('/tts', async (req, res) => {
         const controller = new AbortController();
         inFlight.add(controller);
@@ -194,6 +222,23 @@ export async function init(router) {
             const key = keyFor(req);
             if (!key) throw new RequestError('No Fish API key set. Add it in the Fish Audio TTS settings.', 401);
             const { model, body } = buildTtsRequest(req.body);
+            const owner = ownerOf(req);
+            const useCache = req.body?.cache !== false;
+            const cacheKey = AudioCache.keyFor(model, body);
+            const pendingKey = `${owner}:${cacheKey}`;
+
+            if (useCache) {
+                const shared = jobs.get(pending.get(pendingKey) ?? '', owner);
+                if (shared && !shared.error) return res.json({ id: shared.id, cached: false });
+                const hit = await cache.get(owner, cacheKey);
+                if (hit) {
+                    const job = jobs.create(owner);
+                    jobs.push(job, hit);
+                    jobs.finish(job);
+                    return res.json({ id: job.id, cached: true });
+                }
+            }
+
             release = await limiter.acquire(key, controller.signal);
 
             const timer = setTimeout(() => controller.abort(new DOMException('no answer', 'TimeoutError')), HEADER_TIMEOUT_MS);
@@ -204,10 +249,18 @@ export async function init(router) {
                 clearTimeout(timer);
             }
 
-            const job = jobs.create(ownerOf(req));
+            const job = jobs.create(owner);
+            if (useCache) pending.set(pendingKey, job.id);
             handedOff = true;
-            void pump(job, response, controller, release);
-            res.json({ id: job.id });
+            void pump(job, response, controller, release, (done) => {
+                // Stay findable until the file is written, so a repeat in that window reuses this job.
+                const forget = () => pending.get(pendingKey) === done.id && pending.delete(pendingKey);
+                if (!useCache || done.error || !done.size) return void forget();
+                cache.put(owner, cacheKey, done.chunks[0])
+                    .catch((error) => console.warn(TAG, 'could not cache audio:', error.message))
+                    .finally(forget);
+            });
+            res.json({ id: job.id, cached: false });
         } catch (error) {
             sendError(res, error);
         } finally {
