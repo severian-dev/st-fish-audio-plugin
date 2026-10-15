@@ -1,0 +1,16 @@
+{
+    "name": "st-fish-audio-plugin",
+    "version": "0.1.0",
+    "description": "SillyTavern server plugin that connects the Fish Audio TTS extension to Fish Audio's API.",
+    "type": "module",
+    "main": "index.js",
+    "license": "MIT",
+    "author": "severian-dev",
+    "homepage": "https://github.com/severian-dev/st-fish-audio-plugin",
+    "engines": {
+        "node": ">=18"
+    },
+    "scripts": {
+        "test": "node --test test/*.test.js"
+    }
+}
